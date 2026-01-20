@@ -1,0 +1,7 @@
+Ticker,P/B Ratio,ROE %,Debt/Eq %,Price,Sector,EV/EBITDA,Sector_Avg_EV_EBITDA,Discount_%,Tier
+GGB,0.74,5.51,36.52,3.69,Basic Materials,2.1,10.7,80.37,Fortress
+MHK,0.81,5.2,28.03,109.3,Consumer Cyclical,6.5,12.3,47.15,Fortress
+SBLK,0.91,2.5,50.95,19.22,Industrials,10.38,17.06,39.16,Fortress
+KBH,0.91,10.77,43.4,56.41,Consumer Cyclical,8.24,12.3,33.01,Fortress
+NE,0.99,4.92,43.6,28.24,Energy,5.17,7.06,26.77,Fortress
+MT,0.64,4.72,26.23,45.57,Basic Materials,8.27,10.7,22.71,Fortress

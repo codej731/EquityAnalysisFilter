@@ -1,0 +1,22 @@
+Ticker,Tier,Price,P/E,Sector,Z-Score,ROIC %,Op Margin %,Avg Margin (4Y),Curr Ratio,Int Cov,Mkt Cap (B)
+CLS.TO,Strong,436.06,51.0,Technology,9.49,19.69,10.32,4.51,1.468,11.21,50.16
+SES.TO,Strong,17.71,36.14,Industrials,7.7,47.38,2.91,1.64,1.21,16.84,3.87
+BDT.TO,Strong,29.9,17.59,Industrials,3.28,19.95,5.02,3.33,1.284,8.48,1.66
+PET.TO,Strong,29.31,21.39,Consumer Cyclical,2.82,21.01,15.7,15.72,1.275,3.77,2.02
+CIA.TO,Strong,6.05,27.5,Basic Materials,2.7,11.14,26.77,33.56,2.568,9.17,3.29
+CVE.TO,Strong,25.06,14.49,Energy,2.68,9.6,11.0,10.14,1.729,7.27,47.27
+TCL-A.TO,Strong,22.83,11.19,Consumer Cyclical,2.49,10.13,11.54,8.21,1.292,6.08,1.91
+SU.TO,Strong,69.11,16.11,Energy,2.43,11.24,19.35,17.96,1.348,12.8,83.85
+DOO.TO,Strong,108.96,32.82,Consumer Cyclical,2.35,8.86,9.04,12.88,1.229,1.8,8.0
+WN.TO,Strong,95.37,25.43,Consumer Defensive,2.29,11.91,8.38,7.46,1.416,3.76,36.46
+MFI.TO,Strong,26.03,16.79,Consumer Defensive,2.25,8.52,5.98,3.01,1.466,1.91,3.25
+BDI.TO,Strong,16.68,28.76,Industrials,2.2,8.05,14.56,12.08,1.352,3.62,1.12
+DBM.TO,Strong,10.23,11.62,Industrials,2.17,6.29,4.65,5.21,1.378,2.16,0.9
+RSI.TO,Strong,6.11,12.47,Consumer Defensive,2.16,11.78,6.81,7.79,1.782,4.99,0.78
+EFX.TO,Strong,22.54,14.73,Energy,2.13,9.79,13.0,5.23,1.24,1.79,2.76
+PBH.TO,Strong,99.7,67.82,Consumer Defensive,2.1,7.51,4.6,5.23,1.328,1.85,4.45
+KEY.TO,Strong,44.99,24.06,Energy,2.08,11.31,9.89,12.62,1.881,3.88,10.32
+MTL.TO,Strong,16.67,15.73,Industrials,2.06,9.53,10.58,9.98,1.974,4.18,1.45
+MX.TO,Strong,64.35,15.54,Basic Materials,2.04,7.03,8.61,10.84,2.087,3.11,4.98
+CTC-A.TO,Strong,176.71,12.44,Consumer Cyclical,1.93,8.49,8.89,9.43,1.8,13.0,9.44
+EIF.TO,Strong,91.13,33.02,Industrials,1.89,7.75,13.25,11.3,1.791,2.22,5.11
