@@ -1,4 +1,4 @@
-# Equities Fundamental Analysis Tool
+# Equity Analysis Filter
 
 A powerful, algorithmic stock screener and grading tool for **US and Canadian markets**.
 
