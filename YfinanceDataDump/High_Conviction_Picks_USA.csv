@@ -1,0 +1,9 @@
+Ticker,Price,Sector,Tier,EV/EBITDA,Sector_Avg_EV_EBITDA,Discount_%,Insider_Buys_Count,Net_Shares_Bought
+FSM,10.42,Basic Materials,Fortress,4.83,15.97,69.76,10,2116207.0
+CGAU,16.13,Basic Materials,Fortress,6.29,15.97,60.61,87,4297682.0
+OPCH,36.03,Healthcare,Fortress,16.64,20.85,20.19,8,18954.0
+MU,362.75,Technology,Fortress,18.46,22.16,16.7,3,167433.0
+RAL,53.53,Technology,Fortress,18.91,22.16,14.67,1,2000.0
+CRH,122.97,Basic Materials,Fortress,13.74,15.97,13.96,3,413316.0
+GIL,63.22,Consumer Cyclical,Fortress,13.02,14.37,9.39,105,1426104.0
+SHLS,9.27,Technology,Fortress,20.49,22.16,7.54,3,8335.0

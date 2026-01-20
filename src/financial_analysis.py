@@ -1,5 +1,6 @@
 import time
 
+import yfinance as yf
 import pandas as pd
 
 from src.setup import load_cache
@@ -11,7 +12,7 @@ from src.setup import load_cache
 # we download detailed financial statements and calculate advanced metrics.
 
 
-def get_advanced_metrics(survivor_df):
+def get_advanced_metrics(survivor_df, CACHE_EXPIRY_DAYS, FORTRESS_MARGIN_THRESHOLD, MIN_INTEREST_COVERAGE, MIN_ROIC, calculate_altman_z_yfinance, save_cache):
     """
     Perform deep financial analysis on stocks that passed initial screening.
 
