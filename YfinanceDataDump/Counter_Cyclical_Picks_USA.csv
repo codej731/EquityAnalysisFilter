@@ -1,0 +1,5 @@
+Ticker,Tier,Price,P/E,Sector,Z-Score,ROIC %,Op Margin %,Avg Margin (4Y),Curr Ratio,Int Cov,Mkt Cap (B),Beta
+STNG,Fortress,69.89,11.67,Energy,3.76,21.15,34.24,34.37,4.806,8.29,3.62,-0.29
+HAFN,Fortress,6.63,10.87,Industrials,3.25,27.25,16.77,24.63,1.476,15.86,3.32,-0.27
+DHT,Fortress,15.48,11.82,Energy,4.12,15.43,47.41,18.35,2.796,6.99,2.49,-0.08
+PDD,Fortress,104.57,10.53,Consumer Cyclical,3.17,41.91,23.11,20.47,2.355,100.0,148.45,-0.01

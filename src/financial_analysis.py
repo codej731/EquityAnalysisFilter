@@ -200,6 +200,7 @@ def get_advanced_metrics(survivor_df, CACHE_EXPIRY_DAYS, FORTRESS_MARGIN_THRESHO
                     "Curr Ratio": base_row["Curr Ratio"],
                     "Int Cov": round(int_cov, 2),
                     "Mkt Cap (B)": base_row["Mkt Cap (B)"],
+                    "Beta": base_row.get("Beta", None),
                 }
             )
 

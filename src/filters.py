@@ -91,6 +91,9 @@ def get_initial_survivors(
                     # Get P/E ratio
                     pe = data.get("summaryDetail", {}).get("trailingPE")
 
+                    # Get Beta (volatility relative to market)
+                    beta = data.get("defaultKeyStatistics", {}).get("beta", None)
+
                     # ====== APPLY FILTERS ======
                     # Each 'continue' statement skips to the next stock (odd yes but continue skipping to the next stock essentially means it failed the filter and we move on)
 
@@ -138,6 +141,7 @@ def get_initial_survivors(
                             "Mkt Cap (B)": round(
                                 cap / 1_000_000_000, 2
                             ),  # Convert to billions
+                            "Beta": round(beta, 2) if beta else None,
                         }
                     )
 
