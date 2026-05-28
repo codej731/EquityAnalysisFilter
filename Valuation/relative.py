@@ -1,39 +1,28 @@
 """
-Relative Valuation Module — Phase 1
-====================================
+Relative Valuation Module — Phase 1 (yahooquery edition)
+=========================================================
 Computes multiples-based valuation for a single ticker, with comparison to:
-  (a) Sector peer median (across a user-provided peer list)
+  (a) Sector peer median (bulk-fetched in one async call)
   (b) Company's own ~5-year historical median
 
 Multiples covered:
   - Current:    P/E (TTM), Fwd P/E, PEG, EV/EBITDA, EV/EBIT, EV/Sales, P/B, P/S, P/FCF
   - Historical: P/E, EV/EBITDA, EV/EBIT, P/B, P/S, P/FCF
-                (Fwd P/E and PEG omitted — yfinance has no consensus-estimate history)
 
-Output: per-multiple table with current value, peer median, own historical median,
-        implied price under each benchmark, and margin of safety vs current price.
+Why yahooquery:
+  - Bulk async peer fetching (~10x faster than per-ticker yfinance loop)
+  - Explicit TTM rows in statement data (vs yfinance's annual-only DataFrames)
+  - Direct FreeCashFlow line item (no OCF+capex computation needed in many cases)
+  - Already used in your screener (filters.py), so one library to maintain
 
-Limitations
------------
-- yfinance annual statements typically go back 4 years, so "5Y history" is really 4 data points.
-- Historical multiples use fiscal year-end prices vs annual fiscal metrics (no intra-year detail).
-- Doesn't handle banks/insurers/REITs differently — these need DDM / FFO / residual income
-  (Phase 5). Flag sector in the survivor df and skip or branch accordingly.
-- .info from yfinance is occasionally rate-limited or stale; cache layer mitigates this.
+Why hybrid with yfinance:
+  - .history() for adjusted prices is more battle-tested
+  - Historical multiples need price lookups at fiscal year-ends; no bulk advantage for one ticker
 
-Usage
------
-    from relative import RelativeValuation, peers_from_survivors
-
-    # Standalone:
+Usage:
     rv = RelativeValuation("AAPL")
     summary = rv.valuation_summary(peer_tickers=["MSFT", "GOOGL", "META", "AMZN"])
     print(summary)
-
-    # Integrated with existing screener output:
-    survivors = pd.read_csv("YfinanceDataDump/fortress_stocks.csv")
-    peers = peers_from_survivors("AAPL", survivors)
-    summary = RelativeValuation("AAPL").valuation_summary(peer_tickers=peers)
 """
 
 import json
@@ -44,6 +33,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from yahooquery import Ticker as YQTicker
 
 
 # ---------------------------------------------------------------------------
@@ -73,43 +63,192 @@ def _save_cache(cache: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Safe-extract helper for yfinance financial statements
+# yahooquery field-name dictionaries (CamelCase, mirroring Yahoo's raw fields)
 # ---------------------------------------------------------------------------
 
-def _get_line(df: Optional[pd.DataFrame], keys: list, col_index: int = 0):
-    """Pull a value from a yfinance statement DataFrame, trying multiple key names.
-    
-    yfinance uses inconsistent labels (e.g. 'EBIT' vs 'Operating Income'); the keys
-    list gives a fallback chain. col_index=0 = most recent fiscal period.
+# Income statement
+KEYS_IS = {
+    "revenue":    ["TotalRevenue", "Revenue"],
+    "ebit":       ["EBIT", "OperatingIncome"],
+    "ebitda":     ["EBITDA", "NormalizedEBITDA"],
+    "net_income": ["NetIncome", "NetIncomeCommonStockholders"],
+    "shares":     ["DilutedAverageShares", "BasicAverageShares"],
+}
+
+# Balance sheet
+KEYS_BS = {
+    "equity": ["StockholdersEquity", "TotalEquityGrossMinorityInterest"],
+    "debt":   ["TotalDebt", "LongTermDebt"],
+    "cash":   ["CashAndCashEquivalents",
+               "CashCashEquivalentsAndShortTermInvestments"],
+}
+
+# Cash flow
+KEYS_CF = {
+    "ocf":       ["OperatingCashFlow",
+                  "CashFlowFromContinuingOperatingActivities"],
+    "capex":     ["CapitalExpenditure"],
+    "fcf":       ["FreeCashFlow"],   # yahooquery often provides this directly
+    "dep_amort": ["DepreciationAndAmortization", "ReconciledDepreciation"],
+}
+
+
+# ---------------------------------------------------------------------------
+# Statement extraction helpers
+# ---------------------------------------------------------------------------
+
+def _select_ticker_rows(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Pull rows for a single ticker from a yahooquery statement DataFrame.
+
+    yahooquery returns the symbol as the index (single ticker) or as a level
+    of a MultiIndex (multiple tickers). Normalize to a flat DataFrame.
+    """
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        return pd.DataFrame()
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()  # yahooquery returns strings on error
+
+    if isinstance(df.index, pd.MultiIndex):
+        if ticker in df.index.get_level_values(0):
+            return df.loc[ticker].copy()
+        return pd.DataFrame()
+    if df.index.name == "symbol":
+        try:
+            sub = df.loc[ticker]
+            return sub if isinstance(sub, pd.DataFrame) else sub.to_frame().T
+        except KeyError:
+            return pd.DataFrame()
+    return df.copy()
+
+
+def _yq_value(df: pd.DataFrame, keys: list, period: str = "latest") -> Optional[float]:
+    """Extract a value from a yahooquery statement DataFrame.
+
+    period:
+      'latest'        -> last row chronologically (TTM if present, else most recent annual)
+      'ttm'           -> TTM row only (returns None if not present)
+      'annual_latest' -> most recent annual fiscal period (excludes TTM)
+      int             -> Nth row in chronological order (0 = oldest)
     """
     if df is None or df.empty:
         return None
-    for key in keys:
-        if key in df.index:
-            try:
-                val = df.loc[key].iloc[col_index]
-                if pd.notna(val):
+
+    work = df.copy()
+    if "asOfDate" in work.columns:
+        work = work.sort_values("asOfDate")
+
+    try:
+        if period == "ttm":
+            if "periodType" in work.columns:
+                ttm_rows = work[work["periodType"] == "TTM"]
+                if ttm_rows.empty:
+                    return None
+                row = ttm_rows.iloc[-1]
+            else:
+                return None
+        elif period == "annual_latest":
+            if "periodType" in work.columns:
+                annual = work[work["periodType"] == "12M"]
+                if annual.empty:
+                    return None
+                row = annual.iloc[-1]
+            else:
+                row = work.iloc[-1]
+        elif period == "latest":
+            row = work.iloc[-1]
+        elif isinstance(period, int):
+            row = work.iloc[period]
+        else:
+            return None
+    except Exception:
+        return None
+
+    for k in keys:
+        if k in row.index:
+            val = row[k]
+            if pd.notna(val):
+                try:
                     return float(val)
-            except Exception:
-                continue
+                except (TypeError, ValueError):
+                    continue
     return None
 
 
-# Standardized key fallbacks — centralized so adding new metrics is one place
-KEYS = {
-    "revenue":      ["Total Revenue", "Revenue"],
-    "ebit":         ["EBIT", "Operating Income"],
-    "net_income":   ["Net Income", "Net Income Common Stockholders"],
-    "total_equity": ["Stockholders Equity", "Total Equity Gross Minority Interest"],
-    "total_debt":   ["Total Debt", "Long Term Debt"],
-    "cash":         ["Cash And Cash Equivalents",
-                     "Cash Cash Equivalents And Short Term Investments"],
-    "shares":       ["Diluted Average Shares", "Basic Average Shares", "Share Issued"],
-    "ocf":          ["Operating Cash Flow",
-                     "Cash Flow From Continuing Operating Activities"],
-    "capex":        ["Capital Expenditure", "Capital Expenditures"],
-    "dep_amort":    ["Depreciation And Amortization", "Reconciled Depreciation"],
-}
+def _annual_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Return only annual (12M) periods from a yahooquery statement, sorted by date."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    work = df.copy()
+    if "periodType" in work.columns:
+        work = work[work["periodType"] == "12M"]
+    if "asOfDate" in work.columns:
+        work = work.sort_values("asOfDate")
+    return work
+
+
+# ---------------------------------------------------------------------------
+# Pure function: compute multiples from already-fetched raw data
+# Used by both single-ticker and bulk-peer paths so logic stays in one place
+# ---------------------------------------------------------------------------
+
+def _compute_current_multiples(modules: dict,
+                                income_df: pd.DataFrame,
+                                balance_df: pd.DataFrame,
+                                cashflow_df: pd.DataFrame) -> dict:
+    """Compute current multiples from yahooquery modules + statement DataFrames.
+
+    All data must already be filtered to the single ticker of interest.
+    Returns dict with None for any multiple that couldn't be computed.
+    """
+    def _safe(key):
+        v = modules.get(key) if isinstance(modules, dict) else None
+        return v if isinstance(v, dict) else {}
+
+    price_mod = _safe("price")
+    sd = _safe("summaryDetail")
+    ks = _safe("defaultKeyStatistics")
+
+    price = price_mod.get("regularMarketPrice")
+    market_cap = price_mod.get("marketCap")
+    enterprise_value = ks.get("enterpriseValue")
+
+    # Directly available multiples
+    pe_ttm    = sd.get("trailingPE")
+    pe_fwd    = sd.get("forwardPE") or ks.get("forwardPE")
+    peg       = ks.get("pegRatio") or ks.get("trailingPegRatio")
+    ev_ebitda = ks.get("enterpriseToEbitda")
+    ev_sales  = ks.get("enterpriseToRevenue")
+    pb        = ks.get("priceToBook")
+    ps        = sd.get("priceToSalesTrailing12Months")
+
+    # EV/EBIT — not in modules, compute (TTM preferred)
+    ebit = _yq_value(income_df, KEYS_IS["ebit"], "ttm") \
+        or _yq_value(income_df, KEYS_IS["ebit"], "annual_latest")
+    ev_ebit = (enterprise_value / ebit) if (enterprise_value and ebit and ebit > 0) else None
+
+    # P/FCF — try yahooquery's direct FreeCashFlow first
+    fcf = _yq_value(cashflow_df, KEYS_CF["fcf"], "ttm") \
+        or _yq_value(cashflow_df, KEYS_CF["fcf"], "annual_latest")
+    if fcf is None:
+        ocf = _yq_value(cashflow_df, KEYS_CF["ocf"], "latest")
+        capex = _yq_value(cashflow_df, KEYS_CF["capex"], "latest")
+        if ocf is not None and capex is not None:
+            fcf = ocf + capex if capex < 0 else ocf - capex
+    p_fcf = (market_cap / fcf) if (market_cap and fcf and fcf > 0) else None
+
+    return {
+        "Price":      price,
+        "Market Cap": market_cap,
+        "P/E (TTM)":  pe_ttm,
+        "Fwd P/E":    pe_fwd,
+        "PEG":        peg,
+        "EV/EBITDA":  ev_ebitda,
+        "EV/EBIT":    ev_ebit,
+        "EV/Sales":   ev_sales,
+        "P/B":        pb,
+        "P/S":        ps,
+        "P/FCF":      p_fcf,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -120,178 +259,160 @@ class RelativeValuation:
     """Compute relative valuation multiples for a single ticker."""
 
     MULTIPLES_FOR_IMPLIED_PRICE = ["P/E (TTM)", "EV/EBITDA", "EV/EBIT", "P/B", "P/S", "P/FCF"]
+    MODULES_TO_FETCH = "summaryDetail price financialData defaultKeyStatistics summaryProfile"
 
     def __init__(self, ticker: str, use_cache: bool = True):
         self.ticker = ticker.upper()
         self.use_cache = use_cache
-        self._stock = yf.Ticker(self.ticker)
+        self._yq = YQTicker(self.ticker)
+        self._yf = yf.Ticker(self.ticker)  # used only for historical price lookups
 
-        # Lazy-loaded — avoids unnecessary API calls
-        self._info = None
-        self._financials = None
+        # Lazy-loaded
+        self._modules = None
+        self._income = None
         self._balance = None
         self._cashflow = None
 
     # -- Lazy property loaders ----------------------------------------------
 
     @property
-    def info(self) -> dict:
-        if self._info is None:
+    def modules(self) -> dict:
+        if self._modules is None:
             try:
-                self._info = self._stock.info or {}
+                data = self._yq.get_modules(self.MODULES_TO_FETCH)
+                self._modules = data.get(self.ticker, {}) if isinstance(data, dict) else {}
             except Exception as e:
-                print(f"[{self.ticker}] .info fetch failed: {e}")
-                self._info = {}
-        return self._info
+                print(f"[{self.ticker}] modules fetch failed: {e}")
+                self._modules = {}
+        return self._modules
 
     @property
-    def financials(self) -> pd.DataFrame:
-        if self._financials is None:
-            self._financials = self._stock.financials
-        return self._financials
+    def income(self) -> pd.DataFrame:
+        if self._income is None:
+            try:
+                df = self._yq.income_statement(frequency="a", trailing=True)
+                self._income = _select_ticker_rows(df, self.ticker)
+            except Exception as e:
+                print(f"[{self.ticker}] income_statement failed: {e}")
+                self._income = pd.DataFrame()
+        return self._income
 
     @property
-    def balance_sheet(self) -> pd.DataFrame:
+    def balance(self) -> pd.DataFrame:
         if self._balance is None:
-            self._balance = self._stock.balance_sheet
+            try:
+                df = self._yq.balance_sheet(frequency="a")
+                self._balance = _select_ticker_rows(df, self.ticker)
+            except Exception as e:
+                print(f"[{self.ticker}] balance_sheet failed: {e}")
+                self._balance = pd.DataFrame()
         return self._balance
 
     @property
     def cashflow(self) -> pd.DataFrame:
         if self._cashflow is None:
-            self._cashflow = self._stock.cashflow
+            try:
+                df = self._yq.cash_flow(frequency="a", trailing=True)
+                self._cashflow = _select_ticker_rows(df, self.ticker)
+            except Exception as e:
+                print(f"[{self.ticker}] cash_flow failed: {e}")
+                self._cashflow = pd.DataFrame()
         return self._cashflow
 
-    # -- Current multiples (TTM / forward) ----------------------------------
+    # -- Current multiples --------------------------------------------------
 
     def current_multiples(self) -> dict:
-        """Pull current TTM/forward multiples — most from .info, EV/EBIT and P/FCF computed."""
-        info = self.info
+        return _compute_current_multiples(
+            self.modules, self.income, self.balance, self.cashflow
+        )
 
-        price = info.get("currentPrice") or info.get("regularMarketPrice")
-        market_cap = info.get("marketCap")
-        enterprise_value = info.get("enterpriseValue")
-
-        # Direct from .info
-        pe_ttm    = info.get("trailingPE")
-        pe_fwd    = info.get("forwardPE")
-        peg       = info.get("pegRatio") or info.get("trailingPegRatio")
-        ev_ebitda = info.get("enterpriseToEbitda")
-        ev_sales  = info.get("enterpriseToRevenue")
-        pb        = info.get("priceToBook")
-        ps        = info.get("priceToSalesTrailing12Months")
-
-        # EV/EBIT — not in .info, compute manually
-        ebit = _get_line(self.financials, KEYS["ebit"])
-        ev_ebit = (enterprise_value / ebit) if (enterprise_value and ebit and ebit > 0) else None
-
-        # P/FCF — compute from cashflow statement
-        # yfinance returns capex as a negative number; add it to OCF to get FCF
-        ocf = _get_line(self.cashflow, KEYS["ocf"])
-        capex = _get_line(self.cashflow, KEYS["capex"])
-        if ocf is not None and capex is not None:
-            fcf = ocf + capex if capex < 0 else ocf - capex
-            p_fcf = (market_cap / fcf) if (market_cap and fcf and fcf > 0) else None
-        else:
-            p_fcf = None
-
-        return {
-            "Price":       price,
-            "Market Cap":  market_cap,
-            "P/E (TTM)":   pe_ttm,
-            "Fwd P/E":     pe_fwd,
-            "PEG":         peg,
-            "EV/EBITDA":   ev_ebitda,
-            "EV/EBIT":     ev_ebit,
-            "EV/Sales":    ev_sales,
-            "P/B":         pb,
-            "P/S":         ps,
-            "P/FCF":       p_fcf,
-        }
-
-    # -- Historical multiples (annual snapshots) ----------------------------
+    # -- Historical multiples (annual fiscal periods only) ------------------
 
     def historical_multiples(self) -> pd.DataFrame:
-        """Fiscal year-end multiples for the past ~4 years using YE price × annual fiscals."""
-        fin = self.financials
-        bs = self.balance_sheet
-        cf = self.cashflow
+        """Fiscal year-end multiples for ~4 prior years (yahooquery 12M rows only)."""
+        income_ann = _annual_rows(self.income)
+        balance_ann = _annual_rows(self.balance)
+        cashflow_ann = _annual_rows(self.cashflow)
 
-        if fin is None or fin.empty or bs is None or bs.empty:
+        if income_ann.empty or balance_ann.empty:
             return pd.DataFrame()
 
-        fiscal_dates = fin.columns
+        fiscal_dates = pd.to_datetime(income_ann["asOfDate"]).sort_values()
 
-        # Pull prices covering the full window with buffer for closest-trading-day lookup
         try:
-            prices = self._stock.history(
-                start=fiscal_dates.min() - pd.Timedelta(days=30),
-                end=fiscal_dates.max() + pd.Timedelta(days=30),
+            buffer = pd.Timedelta(days=30)
+            prices = self._yf.history(
+                start=fiscal_dates.min() - buffer,
+                end=fiscal_dates.max() + buffer,
                 auto_adjust=True,
             )
         except Exception as e:
-            print(f"[{self.ticker}] Historical price fetch failed: {e}")
+            print(f"[{self.ticker}] historical price fetch failed: {e}")
             return pd.DataFrame()
 
         if prices.empty:
             return pd.DataFrame()
 
-        # Normalize timezones so date math doesn't blow up
         prices_idx = prices.index.tz_localize(None) if prices.index.tz else prices.index
 
-        # Backup share count source if annual `shares` line is missing
-        try:
-            shares_hist = self._stock.get_shares_full(start=fiscal_dates.min())
-        except Exception:
-            shares_hist = None
+        def _row_for_date(df, date):
+            if "asOfDate" not in df.columns:
+                return None
+            matches = df[pd.to_datetime(df["asOfDate"]) == date]
+            return matches.iloc[0] if not matches.empty else None
+
+        def _val(row, keys):
+            if row is None:
+                return None
+            for k in keys:
+                if k in row.index and pd.notna(row[k]):
+                    try:
+                        return float(row[k])
+                    except (TypeError, ValueError):
+                        continue
+            return None
 
         records = []
-        for i, fy_end in enumerate(fiscal_dates):
+        for fy_end in fiscal_dates:
             try:
                 fy_naive = pd.Timestamp(fy_end).tz_localize(None) \
                     if pd.Timestamp(fy_end).tz else pd.Timestamp(fy_end)
 
-                # Closest trading day's close
                 closest_idx = (abs(prices_idx - fy_naive)).argmin()
                 price = float(prices["Close"].iloc[closest_idx])
 
-                # Statement values at fiscal year i (col 0 = most recent)
-                revenue    = _get_line(fin, KEYS["revenue"],      col_index=i)
-                ebit       = _get_line(fin, KEYS["ebit"],         col_index=i)
-                net_income = _get_line(fin, KEYS["net_income"],   col_index=i)
-                equity     = _get_line(bs,  KEYS["total_equity"], col_index=i)
-                debt       = _get_line(bs,  KEYS["total_debt"],   col_index=i) or 0
-                cash       = _get_line(bs,  KEYS["cash"],         col_index=i) or 0
-                shares     = _get_line(fin, KEYS["shares"],       col_index=i)
-                dep        = _get_line(cf,  KEYS["dep_amort"],    col_index=i) or 0
-                ocf        = _get_line(cf,  KEYS["ocf"],          col_index=i)
-                capex      = _get_line(cf,  KEYS["capex"],        col_index=i)
+                is_row = _row_for_date(income_ann, fy_end)
+                bs_row = _row_for_date(balance_ann, fy_end)
+                cf_row = _row_for_date(cashflow_ann, fy_end)
 
-                # Share count fallback
+                revenue    = _val(is_row, KEYS_IS["revenue"])
+                ebit       = _val(is_row, KEYS_IS["ebit"])
+                net_income = _val(is_row, KEYS_IS["net_income"])
+                shares     = _val(is_row, KEYS_IS["shares"])
+                equity     = _val(bs_row, KEYS_BS["equity"])
+                debt       = _val(bs_row, KEYS_BS["debt"]) or 0
+                cash       = _val(bs_row, KEYS_BS["cash"]) or 0
+                fcf        = _val(cf_row, KEYS_CF["fcf"])
+                if fcf is None:
+                    ocf   = _val(cf_row, KEYS_CF["ocf"])
+                    capex = _val(cf_row, KEYS_CF["capex"])
+                    if ocf is not None and capex is not None:
+                        fcf = ocf + capex if capex < 0 else ocf - capex
+                dep        = _val(cf_row, KEYS_CF["dep_amort"]) or 0
+
                 if not shares or shares <= 0:
-                    if shares_hist is not None and len(shares_hist) > 0:
-                        try:
-                            shares = float(shares_hist.asof(fy_naive))
-                        except Exception:
-                            continue
-                    else:
-                        continue
+                    continue
 
                 market_cap = price * shares
                 enterprise_value = market_cap + debt - cash
                 ebitda = (ebit + dep) if ebit is not None else None
 
-                pe        = (market_cap / net_income) if (net_income and net_income > 0) else None
-                pb        = (market_cap / equity)     if (equity and equity > 0)         else None
-                ps        = (market_cap / revenue)    if (revenue and revenue > 0)       else None
-                ev_ebitda = (enterprise_value / ebitda) if (ebitda and ebitda > 0)       else None
-                ev_ebit   = (enterprise_value / ebit)   if (ebit and ebit > 0)           else None
-
-                if ocf is not None and capex is not None:
-                    fcf = ocf + capex if capex < 0 else ocf - capex
-                    p_fcf = (market_cap / fcf) if fcf > 0 else None
-                else:
-                    p_fcf = None
+                pe        = (market_cap / net_income)     if (net_income and net_income > 0) else None
+                pb        = (market_cap / equity)         if (equity and equity > 0)         else None
+                ps        = (market_cap / revenue)        if (revenue and revenue > 0)       else None
+                ev_ebitda = (enterprise_value / ebitda)   if (ebitda and ebitda > 0)         else None
+                ev_ebit   = (enterprise_value / ebit)     if (ebit and ebit > 0)             else None
+                p_fcf     = (market_cap / fcf)            if (fcf and fcf > 0)               else None
 
                 records.append({
                     "Fiscal Year End": fy_naive.date(),
@@ -308,52 +429,80 @@ class RelativeValuation:
 
         if not records:
             return pd.DataFrame()
-
         return pd.DataFrame(records).sort_values("Fiscal Year End").reset_index(drop=True)
 
-    # -- Peer multiples (batch fetch with caching) --------------------------
+    # -- Peer multiples (THE bulk-async win) --------------------------------
 
     @staticmethod
     def peer_multiples(peer_tickers: list, use_cache: bool = True) -> pd.DataFrame:
-        """Fetch current multiples for each peer ticker; returns DF indexed by ticker."""
+        """Fetch current multiples for all peers in one bulk async call.
+
+        This is the main reason to use yahooquery over yfinance — one async
+        request instead of N sequential ones.
+        """
         cache = _load_cache() if use_cache else {}
         now = time.time()
-        rows = []
 
+        cached_rows = []
+        to_fetch = []
         for tk in peer_tickers:
+            tk = tk.upper()
             cached = cache.get(tk)
             if cached and (now - cached.get("_ts", 0)) < CACHE_EXPIRY_HOURS * 3600:
                 row = {k: v for k, v in cached.items() if k != "_ts"}
                 row["Ticker"] = tk
-                rows.append(row)
-                continue
+                cached_rows.append(row)
+            else:
+                to_fetch.append(tk)
 
+        rows = list(cached_rows)
+
+        if to_fetch:
+            print(f"Bulk-fetching {len(to_fetch)} peers via yahooquery (async)...")
             try:
-                m = RelativeValuation(tk, use_cache=False).current_multiples()
-                m["Ticker"] = tk
-                rows.append(m)
-                cache[tk] = {**m, "_ts": now}
-            except Exception as e:
-                print(f"[peer fetch] {tk} failed: {e}")
-                continue
+                yq = YQTicker(to_fetch, asynchronous=True)
+                modules_all = yq.get_modules(RelativeValuation.MODULES_TO_FETCH)
+                income_all = yq.income_statement(frequency="a", trailing=True)
+                balance_all = yq.balance_sheet(frequency="a")
+                cashflow_all = yq.cash_flow(frequency="a", trailing=True)
 
-        if use_cache:
-            _save_cache(cache)
+                if not isinstance(modules_all, dict):
+                    modules_all = {}
+
+                for tk in to_fetch:
+                    tk_modules = modules_all.get(tk, {}) if isinstance(modules_all.get(tk), dict) else {}
+                    if not tk_modules:
+                        print(f"  [skip] {tk}: no module data")
+                        continue
+
+                    tk_income = _select_ticker_rows(income_all, tk)
+                    tk_balance = _select_ticker_rows(balance_all, tk)
+                    tk_cashflow = _select_ticker_rows(cashflow_all, tk)
+
+                    m = _compute_current_multiples(
+                        tk_modules, tk_income, tk_balance, tk_cashflow
+                    )
+                    m["Ticker"] = tk
+                    rows.append(m)
+                    cache[tk] = {**m, "_ts": now}
+
+                if use_cache:
+                    _save_cache(cache)
+
+            except Exception as e:
+                print(f"[peer bulk fetch] failed: {e}")
 
         if not rows:
             return pd.DataFrame()
-
-        df = pd.DataFrame(rows).set_index("Ticker")
-        return df
+        return pd.DataFrame(rows).set_index("Ticker")
 
     # -- Implied price back-solver ------------------------------------------
 
     def _implied_price(self, multiple_name: str, mult_value: Optional[float],
                        fundamentals: dict) -> Optional[float]:
-        """Back-solve the implied per-share price from a target multiple."""
+        """Back-solve the implied per-share price from a target multiple value."""
         if not mult_value or mult_value <= 0:
             return None
-
         shares = fundamentals["shares"]
         if not shares or shares <= 0:
             return None
@@ -377,68 +526,70 @@ class RelativeValuation:
             if multiple_name == "P/FCF" and fcf and fcf > 0:
                 return mult_value * fcf / shares
             if multiple_name == "EV/EBITDA" and ebitda and ebitda > 0:
-                implied_ev = mult_value * ebitda
-                return (implied_ev - debt + cash) / shares
+                return (mult_value * ebitda - debt + cash) / shares
             if multiple_name == "EV/EBIT" and ebit and ebit > 0:
-                implied_ev = mult_value * ebit
-                return (implied_ev - debt + cash) / shares
+                return (mult_value * ebit - debt + cash) / shares
         except Exception:
             return None
         return None
 
-    # -- Triangulation summary (the main output) ----------------------------
+    # -- Triangulation summary (main output) --------------------------------
 
     def valuation_summary(self, peer_tickers: Optional[list] = None) -> pd.DataFrame:
         """Per-multiple table: current vs peer median vs own median, with implied prices."""
         current = self.current_multiples()
         hist = self.historical_multiples()
-        price = current["Price"]
+        price = current.get("Price")
 
-        # Bundle fundamentals once for implied-price calcs
-        ocf   = _get_line(self.cashflow, KEYS["ocf"])
-        capex = _get_line(self.cashflow, KEYS["capex"])
-        if ocf is not None and capex is not None:
-            fcf = ocf + capex if capex < 0 else ocf - capex
-        else:
-            fcf = None
-        ebit = _get_line(self.financials, KEYS["ebit"])
-        dep  = _get_line(self.cashflow, KEYS["dep_amort"]) or 0
+        # Bundle fundamentals once (TTM-preferred) for implied-price back-solving
+        ebit = _yq_value(self.income, KEYS_IS["ebit"], "ttm") \
+            or _yq_value(self.income, KEYS_IS["ebit"], "annual_latest")
+        dep = _yq_value(self.cashflow, KEYS_CF["dep_amort"], "ttm") \
+            or _yq_value(self.cashflow, KEYS_CF["dep_amort"], "annual_latest") or 0
+
+        fcf = _yq_value(self.cashflow, KEYS_CF["fcf"], "ttm") \
+            or _yq_value(self.cashflow, KEYS_CF["fcf"], "annual_latest")
+        if fcf is None:
+            ocf = _yq_value(self.cashflow, KEYS_CF["ocf"], "latest")
+            capex = _yq_value(self.cashflow, KEYS_CF["capex"], "latest")
+            if ocf is not None and capex is not None:
+                fcf = ocf + capex if capex < 0 else ocf - capex
+
+        ks = self.modules.get("defaultKeyStatistics", {}) if isinstance(self.modules, dict) else {}
+        shares = ks.get("sharesOutstanding") if isinstance(ks, dict) else None
+        if not shares:
+            shares = _yq_value(self.income, KEYS_IS["shares"], "annual_latest")
 
         fundamentals = {
-            "shares":     self.info.get("sharesOutstanding"),
-            "net_income": _get_line(self.financials, KEYS["net_income"]),
-            "revenue":    _get_line(self.financials, KEYS["revenue"]),
+            "shares":     shares,
+            "net_income": _yq_value(self.income, KEYS_IS["net_income"], "ttm")
+                          or _yq_value(self.income, KEYS_IS["net_income"], "annual_latest"),
+            "revenue":    _yq_value(self.income, KEYS_IS["revenue"], "ttm")
+                          or _yq_value(self.income, KEYS_IS["revenue"], "annual_latest"),
             "ebit":       ebit,
             "ebitda":     (ebit + dep) if ebit is not None else None,
-            "equity":     _get_line(self.balance_sheet, KEYS["total_equity"]),
-            "debt":       _get_line(self.balance_sheet, KEYS["total_debt"]) or 0,
-            "cash":       _get_line(self.balance_sheet, KEYS["cash"]) or 0,
+            "equity":     _yq_value(self.balance, KEYS_BS["equity"], "annual_latest"),
+            "debt":       _yq_value(self.balance, KEYS_BS["debt"], "annual_latest") or 0,
+            "cash":       _yq_value(self.balance, KEYS_BS["cash"], "annual_latest") or 0,
             "fcf":        fcf,
         }
 
-        # Peer medians
+        peer_medians = pd.Series(dtype=float)
+        peer_n = pd.Series(dtype=int)
         if peer_tickers:
-            print(f"Fetching peer multiples for {len(peer_tickers)} peers...")
             peers = self.peer_multiples(peer_tickers)
             if not peers.empty:
-                peer_medians = peers[self.MULTIPLES_FOR_IMPLIED_PRICE].median(numeric_only=True)
-                peer_n = peers[self.MULTIPLES_FOR_IMPLIED_PRICE].notna().sum()
-            else:
-                peer_medians = pd.Series(dtype=float)
-                peer_n = pd.Series(dtype=int)
-        else:
-            peer_medians = pd.Series(dtype=float)
-            peer_n = pd.Series(dtype=int)
+                cols = [c for c in self.MULTIPLES_FOR_IMPLIED_PRICE if c in peers.columns]
+                peer_medians = peers[cols].median(numeric_only=True)
+                peer_n = peers[cols].notna().sum()
 
-        # Own historical medians
+        hist_medians = pd.Series(dtype=float)
+        hist_n = pd.Series(dtype=int)
         if not hist.empty:
-            hist_medians = hist[self.MULTIPLES_FOR_IMPLIED_PRICE].median(numeric_only=True)
-            hist_n = hist[self.MULTIPLES_FOR_IMPLIED_PRICE].notna().sum()
-        else:
-            hist_medians = pd.Series(dtype=float)
-            hist_n = pd.Series(dtype=int)
+            cols = [c for c in self.MULTIPLES_FOR_IMPLIED_PRICE if c in hist.columns]
+            hist_medians = hist[cols].median(numeric_only=True)
+            hist_n = hist[cols].notna().sum()
 
-        # Build per-multiple rows
         rows = []
         for m in self.MULTIPLES_FOR_IMPLIED_PRICE:
             cur_val  = current.get(m)
@@ -449,7 +600,6 @@ class RelativeValuation:
 
             imp_peer = self._implied_price(m, peer_med, fundamentals)
             imp_hist = self._implied_price(m, hist_med, fundamentals)
-
             mos_peer = ((imp_peer - price) / price * 100) if (imp_peer and price) else None
             mos_hist = ((imp_hist - price) / price * 100) if (imp_hist and price) else None
 
@@ -467,7 +617,6 @@ class RelativeValuation:
             })
 
         summary = pd.DataFrame(rows)
-        # Stash context on the DF for downstream display
         summary.attrs["ticker"] = self.ticker
         summary.attrs["price"]  = price
         return summary
@@ -479,7 +628,7 @@ class RelativeValuation:
 
 def peers_from_survivors(ticker: str, survivors_df: pd.DataFrame,
                          exclude_self: bool = True) -> list:
-    """Return tickers from the same sector as `ticker`, drawn from the screener output."""
+    """Return tickers from the same sector as `ticker`, drawn from screener output."""
     if "Sector" not in survivors_df.columns or "Ticker" not in survivors_df.columns:
         raise ValueError("survivors_df must contain 'Ticker' and 'Sector' columns")
 
