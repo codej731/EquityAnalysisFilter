@@ -1,0 +1,95 @@
+# Every threshold and weight lives here. The hash of this file is recorded in
+# run_log.config_hash, so any change produces a distinguishable run.
+
+paths:
+  db: store/engine.duckdb
+  snapshots: snapshots
+  cache: cache/raw
+
+# Hours before a cached raw API response is refetched.
+cache_ttl_hours:
+  yahooquery: 24
+  yfinance: 24
+  edgar: 168
+
+sources:
+  # Highest priority first (schema §1).
+  priority: [edgar, yahooquery, yfinance]
+  # Same field/period differing by more than this across sources is logged.
+  conflict_tolerance: 0.05
+
+sec:
+  # Required by the SEC fair-access policy: "Your Name your@email.com".
+  # EDGAR ingestion is skipped while this is empty.
+  user_agent: ""
+  # Seconds between requests (SEC allows at most 10 per second).
+  request_interval: 0.15
+
+ingest:
+  batch_size: 100          # symbols per yahooquery request
+  price_history: 5y        # yahooquery history period
+  use_yfinance_fallback: true
+
+# Days after period_end before a Yahoo-sourced figure is treated as known
+# (schema §5). EDGAR rows use the actual filing date instead.
+availability_lag_days:
+  US:   {Q: 45, FY: 90}
+  TSX:  {Q: 45, FY: 90}
+  TSXV: {Q: 60, FY: 120}
+
+fx:
+  # "yahooquery" pulls daily rates (e.g. USDCAD=X); "static" uses the table below.
+  provider: yahooquery
+  # Used when provider is "static", or as a last resort when a live rate is missing.
+  # Keys are FROM+TO, value is units of TO per one FROM.
+  static_rates:
+    USDCAD: 1.37
+  allow_static_fallback: false
+
+validation:
+  staleness_months: 15
+  balance_identity_tolerance: 0.02
+  share_jump_threshold: 0.50
+  # Completeness knockout: at least `min_required_fields` of these must be
+  # present in the latest FY.
+  required_fields:
+    - revenue
+    - operating_income
+    - net_income
+    - total_assets
+    - total_liabilities
+    - total_equity
+    - cash
+    - operating_cash_flow
+    - capex
+    - shares_outstanding
+  min_required_fields: 8
+  # Ratio bounds used by the outlier check (applied once factors exist, v1.1).
+  outlier_bounds:
+    roic: [-2.0, 2.0]
+    operating_margin: [-2.0, 1.0]
+    ev_ebit: [-500, 500]
+
+debt:
+  # Open decision (schema §8): include IFRS 16 / ASC 842 lease liabilities.
+  include_leases: false
+
+tax:
+  clip: [0.0, 0.40]
+  # Statutory fallback when pretax income <= 0 or missing (schema §4).
+  statutory_rates:
+    US: 0.21
+    CA: 0.265
+    default: 0.25
+
+# ---- Stage settings below are consumed from v1.1 onward ----
+
+universe:
+  min_price: 2.0
+  min_market_cap: 300_000_000
+  min_avg_volume: 50_000
+  # D-010: excluded until sector models exist.
+  excluded_sectors: [Financial Services, Real Estate]
+
+peers:
+  min_peer_count: 5

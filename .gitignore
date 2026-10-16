@@ -1,3 +1,8 @@
+# Local state produced by runs
+store/
+snapshots/
+cache/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
